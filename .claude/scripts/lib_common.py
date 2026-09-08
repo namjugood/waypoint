@@ -137,13 +137,17 @@ def git_commit_and_push(add_paths: list, message: str, use_add_all: bool = False
             log_debug(f"git commit 실패: {commit.stderr[:300]}")
             return False
 
-        push = subprocess.run(["git", "-C", str(PROJECT_ROOT), "push"],
+        # -u origin HEAD: 현재 브랜치가 아직 원격 추적 브랜치가 없어도
+        # (예: 이번 세션에서 아직 한 번도 push 안 된 새 브랜치) 실패하지
+        # 않는다 — 같은 이름으로 원격에 만들고 추적을 설정한다. 이미
+        # upstream이 있으면 그냥 거기로 push하는 것과 동일하게 동작한다.
+        push = subprocess.run(["git", "-C", str(PROJECT_ROOT), "push", "-u", "origin", "HEAD"],
                                capture_output=True, text=True, timeout=60)
         if push.returncode != 0:
             log_debug(f"git push 실패, pull --rebase 후 재시도: {push.stderr[:300]}")
             subprocess.run(["git", "-C", str(PROJECT_ROOT), "pull", "--rebase"],
                             capture_output=True, text=True, timeout=60)
-            retry = subprocess.run(["git", "-C", str(PROJECT_ROOT), "push"],
+            retry = subprocess.run(["git", "-C", str(PROJECT_ROOT), "push", "-u", "origin", "HEAD"],
                                     capture_output=True, text=True, timeout=60)
             if retry.returncode != 0:
                 log_debug(f"git push 재시도도 실패(로컬 커밋은 유지됨): {retry.stderr[:300]}")
@@ -262,11 +266,12 @@ def sync_waypoints_to_master(prepare_fn, commit_message: str, max_retries: int =
         if not pushed:
             return False
 
-        # 현재 세션 브랜치의 로컬 워킹트리도 방금 push된 최종 상태로 맞춰서
-        # git status가 지저분해지지 않게 한다. 이 커밋은 이 브랜치로는
-        # push하지 않는다 — 이미 기본 브랜치에 올라갔으므로 중복 적재할
-        # 필요가 없다 (나중에 이 브랜치로 PR을 올려도, 내용이 이미 같아서
-        # 충돌 없이 무해하게 합쳐진다).
+        # 현재 세션 브랜치의 워킹트리도 방금 push된 최종 상태로 맞춘다.
+        # 이 내용은 이 브랜치로도 커밋+push한다 — 데이터는 이미 기본
+        # 브랜치에 있으니 중복이긴 하지만, 세션 브랜치를 항상 push된
+        # 상태로 유지해야(로컬 전용 커밋을 남겨두지 않아야) 다른 안전망
+        # 훅(unpushed commit 감지 등)과 충돌하지 않는다. 내용이 같아서
+        # 나중에 이 브랜치가 PR로 머지돼도 무해하게 합쳐진다.
         for name in ("tags", "inprogress"):
             local_d = WAYPOINTS_DIR / name
             src_d = tmp_path / "waypoints" / name
@@ -277,20 +282,11 @@ def sync_waypoints_to_master(prepare_fn, commit_message: str, max_retries: int =
         if src_index.exists():
             shutil.copy2(src_index, INDEX_FILE)
 
-        local_status = subprocess.run(
-            ["git", "-C", str(PROJECT_ROOT), "status", "--porcelain", "--", "waypoints"],
-            capture_output=True, text=True, timeout=10,
+        git_commit_and_push(
+            ["waypoints"],
+            f"{commit_message} (mirror; 이미 {default_branch}에 push됨)",
+            use_add_all=True,
         )
-        if local_status.stdout.strip():
-            subprocess.run(["git", "-C", str(PROJECT_ROOT), "add", "-A", "--", "waypoints"],
-                            capture_output=True, text=True, timeout=15)
-            subprocess.run(
-                ["git", "-C", str(PROJECT_ROOT), "-c", "user.email=noreply@anthropic.com",
-                 "-c", "user.name=Claude", "commit", "-m",
-                 f"{commit_message} (local mirror; 이미 {default_branch}에 push됨, "
-                 f"이 브랜치로는 push 안 함)"],
-                capture_output=True, text=True, timeout=15,
-            )
         return True
     except Exception as e:
         log_debug(f"sync_waypoints_to_master 예외: {e}")
