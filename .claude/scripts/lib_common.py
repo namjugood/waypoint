@@ -7,8 +7,10 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -150,6 +152,153 @@ def git_commit_and_push(add_paths: list, message: str, use_add_all: bool = False
     except Exception as e:
         log_debug(f"git_commit_and_push 예외({add_paths}): {e}")
         return False
+
+
+def detect_default_branch() -> str:
+    """origin의 실제 기본 브랜치 이름(master/main 등)을 알아낸다.
+    하드코딩하지 않는 이유: 이 도구는 다른 프로젝트에도 설치될 수 있고,
+    그 프로젝트의 기본 브랜치명이 다를 수 있기 때문."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "ls-remote", "--symref", "origin", "HEAD"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                if line.startswith("ref:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return parts[1].rsplit("/", 1)[-1]
+    except Exception as e:
+        log_debug(f"detect_default_branch 실패: {e}")
+    return None
+
+
+def sync_waypoints_to_master(prepare_fn, commit_message: str, max_retries: int = 5) -> bool:
+    """세션 전용 브랜치가 아니라 저장소 **기본 브랜치**에 waypoints/ 변경만
+    직접 커밋+push한다. 실제 코드 변경(현재 체크아웃된 브랜치의 다른
+    커밋들)은 절대 건드리지 않는다 — 별도의 격리된 git worktree에서
+    origin/<기본브랜치> 기준으로만 작업하기 때문이다.
+
+    prepare_fn(root: Path)은 root 아래(주로 root/waypoints/...)의 파일들을
+    원하는 최종 상태로 만드는 콜백이다. **중요**: push가 다른 세션과
+    충돌해서(non-fast-forward) 재시도할 때마다, worktree를 최신
+    origin/<기본브랜치>로 리셋한 뒤 prepare_fn을 다시 호출한다 — 로컬에
+    미리 계산해둔 스냅샷을 그대로 덮어쓰면, INDEX.md처럼 여러 세션이 동시에
+    건드리는 공유 파일에서 그 사이 다른 세션이 추가한 내용을 지워버리게
+    된다. prepare_fn은 그래서 "그 시점의 최신 내용 위에 내 변경분을
+    다시 적용"하는 방식으로 짜야 한다 (예: update_index()는 항상 그
+    호출 시점의 INDEX.md 내용을 읽어서 한 줄을 삽입하므로, 매번 새로
+    fetch된 최신 위에서 실행되면 자연히 안전하게 병합된다).
+
+    현재 브랜치가 이미 기본 브랜치라면 격리할 이유가 없어 그 자리에서
+    바로 커밋+push한다. worktree 생성이나 기본 브랜치 감지 자체가
+    실패하면 False를 반환한다 — 호출자는 (구식이지만 확실한) 현재
+    브랜치 직접 커밋으로 폴백해야 한다. 데이터 유실 방지가 최우선이므로."""
+    default_branch = detect_default_branch()
+    if not default_branch:
+        return False
+
+    try:
+        current = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "branch", "--show-current"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+    except Exception:
+        current = None
+
+    if current == default_branch:
+        prepare_fn(PROJECT_ROOT)
+        return git_commit_and_push(["waypoints"], commit_message, use_add_all=True)
+
+    tmp_dir = None
+    try:
+        subprocess.run(["git", "-C", str(PROJECT_ROOT), "fetch", "origin", default_branch],
+                        capture_output=True, text=True, timeout=30)
+
+        tmp_dir = tempfile.mkdtemp(prefix="waypoint-master-sync-")
+        wt = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "worktree", "add", "-q", "--detach",
+             tmp_dir, f"origin/{default_branch}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if wt.returncode != 0:
+            log_debug(f"worktree add 실패: {wt.stderr[:300]}")
+            return False
+
+        tmp_path = Path(tmp_dir)
+        pushed = False
+        for attempt in range(max_retries):
+            prepare_fn(tmp_path)
+            subprocess.run(["git", "-C", tmp_dir, "add", "-A", "--", "waypoints"],
+                            capture_output=True, text=True, timeout=15)
+            status = subprocess.run(["git", "-C", tmp_dir, "diff", "--cached", "--quiet"],
+                                     capture_output=True, timeout=10)
+            if status.returncode == 0:
+                pushed = True  # 커밋할 변경 없음(이미 최신) — 정상
+                break
+            commit = subprocess.run(
+                ["git", "-C", tmp_dir, "-c", "user.email=waypoint@local",
+                 "-c", "user.name=Waypoint Bot", "commit", "-m", commit_message],
+                capture_output=True, text=True, timeout=15,
+            )
+            if commit.returncode != 0:
+                log_debug(f"worktree commit 실패: {commit.stderr[:300]}")
+                break
+            push = subprocess.run(
+                ["git", "-C", tmp_dir, "push", "origin", f"HEAD:refs/heads/{default_branch}"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if push.returncode == 0:
+                pushed = True
+                break
+            log_debug(f"{default_branch} push 충돌(시도 {attempt + 1}/{max_retries}), "
+                      f"최신으로 재동기화 후 재계산: {push.stderr[:200]}")
+            subprocess.run(["git", "-C", tmp_dir, "fetch", "origin", default_branch],
+                            capture_output=True, text=True, timeout=30)
+            subprocess.run(["git", "-C", tmp_dir, "reset", "--hard", f"origin/{default_branch}"],
+                            capture_output=True, text=True, timeout=15)
+
+        if not pushed:
+            return False
+
+        # 현재 세션 브랜치의 로컬 워킹트리도 방금 push된 최종 상태로 맞춰서
+        # git status가 지저분해지지 않게 한다. 이 커밋은 이 브랜치로는
+        # push하지 않는다 — 이미 기본 브랜치에 올라갔으므로 중복 적재할
+        # 필요가 없다 (나중에 이 브랜치로 PR을 올려도, 내용이 이미 같아서
+        # 충돌 없이 무해하게 합쳐진다).
+        for name in ("tags", "inprogress"):
+            local_d = WAYPOINTS_DIR / name
+            src_d = tmp_path / "waypoints" / name
+            shutil.rmtree(local_d, ignore_errors=True)
+            if src_d.exists():
+                shutil.copytree(src_d, local_d)
+        src_index = tmp_path / "waypoints" / "INDEX.md"
+        if src_index.exists():
+            shutil.copy2(src_index, INDEX_FILE)
+
+        local_status = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "status", "--porcelain", "--", "waypoints"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if local_status.stdout.strip():
+            subprocess.run(["git", "-C", str(PROJECT_ROOT), "add", "-A", "--", "waypoints"],
+                            capture_output=True, text=True, timeout=15)
+            subprocess.run(
+                ["git", "-C", str(PROJECT_ROOT), "-c", "user.email=waypoint@local",
+                 "-c", "user.name=Waypoint Bot", "commit", "-m",
+                 f"{commit_message} (local mirror; 이미 {default_branch}에 push됨, "
+                 f"이 브랜치로는 push 안 함)"],
+                capture_output=True, text=True, timeout=15,
+            )
+        return True
+    except Exception as e:
+        log_debug(f"sync_waypoints_to_master 예외: {e}")
+        return False
+    finally:
+        if tmp_dir:
+            subprocess.run(["git", "-C", str(PROJECT_ROOT), "worktree", "remove", "--force", tmp_dir],
+                            capture_output=True, text=True, timeout=15)
 
 
 def load_state(session_id: str) -> dict:

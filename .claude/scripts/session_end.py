@@ -22,11 +22,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib_common import (  # noqa: E402
-    PROJECT_ROOT, TAGS_DIR, INDEX_FILE,
+    PROJECT_ROOT, INDEX_FILE,
     log_debug, read_hook_input, inprogress_md_path, state_path,
     detect_project_name, slugify, call_claude_headless,
     extract_first_json_object, in_headless_recursion_guard,
-    git_commit_and_push,
+    git_commit_and_push, sync_waypoints_to_master,
 )
 
 STATUS_LABEL = {"in_progress": "진행중", "done": "완료", "paused": "보류"}
@@ -73,10 +73,16 @@ def build_fallback_result(content: str) -> dict:
 
 
 def update_index(project: str, tag: str, status: str, title: str,
-                  rel_path: str, has_unexplored_alt: bool) -> None:
-    INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
-    if INDEX_FILE.exists():
-        text = INDEX_FILE.read_text(encoding="utf-8")
+                  rel_path: str, has_unexplored_alt: bool,
+                  index_file: Path = INDEX_FILE) -> None:
+    """index_file 인자를 받는 이유: sync_waypoints_to_master()가 push
+    충돌로 재시도할 때마다, 그 시점 최신 origin의 INDEX.md(worktree 안의
+    파일) 위에서 이 함수를 다시 호출해야 한다 — 그래야 그 사이 다른
+    세션이 추가한 항목을 지우지 않고 안전하게 병합된다. 기본값
+    INDEX_FILE은 PROJECT_ROOT 기준 폴백 경로용."""
+    index_file.parent.mkdir(parents=True, exist_ok=True)
+    if index_file.exists():
+        text = index_file.read_text(encoding="utf-8")
     else:
         text = "# Waypoint Index\n"
 
@@ -112,23 +118,35 @@ def update_index(project: str, tag: str, status: str, title: str,
             lines.insert(end_idx + 1, entry_line)
             lines.insert(end_idx + 2, "")
 
-    INDEX_FILE.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    index_file.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
 def finalize_session(project: str, session_id: str) -> None:
+    """분류/정리 결과를 어디에 반영할지는 sync_waypoints_to_master()가
+    맡는다: 실제 코드 변경이 섞여 있는 현재 세션 브랜치가 아니라, 격리된
+    worktree를 통해 저장소 기본 브랜치에 직접 push한다. 여기서는 그
+    prepare_fn을 만드는 데 필요한 내용(분류 결과, 최종 문서 내용 등)만
+    한 번 계산해서 넘긴다 — push 충돌로 재시도될 때마다 prepare_fn이
+    다시 불릴 수 있으므로, 이 계산된 값들은 재시도 사이에 그대로
+    재사용해도 안전한(멱등한) 것들이어야 한다. INDEX.md만 예외라서
+    update_index()를 prepare_fn 안에서 매번 그 시점 최신 파일에 대고
+    다시 실행한다 (자세한 이유는 update_index 문서 참고)."""
     tmp_file = inprogress_md_path(project, session_id)
     if not tmp_file.exists():
         return
     content = tmp_file.read_text(encoding="utf-8")
     if not content.strip() or len(content.splitlines()) <= 3:
         # 헤더(+경고 문구)만 있고 실제 대화가 없으면 그냥 정리만 하고 끝
-        tmp_file.unlink(missing_ok=True)
+        message = f"waypoint: {project} 빈 세션 기록 정리 (session {session_id[:8]})"
+
+        def prepare_empty(root):
+            (root / "waypoints" / "inprogress" / project / f"{session_id}.md").unlink(missing_ok=True)
+
+        if not sync_waypoints_to_master(prepare_empty, message):
+            log_debug(f"master 동기화 실패({session_id}), 현재 브랜치로 폴백")
+            prepare_empty(PROJECT_ROOT)
+            git_commit_and_push(["waypoints"], message, use_add_all=True)
         state_path(session_id).unlink(missing_ok=True)
-        git_commit_and_push(
-            [tmp_file.relative_to(PROJECT_ROOT).as_posix()],
-            f"waypoint: {project} 빈 세션 기록 정리 (session {session_id[:8]})",
-            use_add_all=True,
-        )
         return
 
     prompt = CLASSIFY_INSTRUCTIONS.format(content=content[:20000])
@@ -147,9 +165,7 @@ def finalize_session(project: str, session_id: str) -> None:
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     slug = slugify(title)
-    target_dir = TAGS_DIR / project / primary_tag
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target_file = target_dir / f"{ts}-{slug}.md"
+    target_rel = Path(project) / primary_tag / f"{ts}-{slug}.md"  # waypoints/tags/ 기준 상대경로
 
     frontmatter = (
         f"---\n"
@@ -165,38 +181,44 @@ def finalize_session(project: str, session_id: str) -> None:
     if has_alt and result.get("unexplored_summary"):
         body += f"\n\n## 미탐색 대안\n{result['unexplored_summary']}\n"
 
-    # 산출물 복사
     deliverables = extract_deliverable_paths(content)
+    attach_dirname = f"{ts}-{slug}-attachments"
     if deliverables:
-        attach_dir = target_dir / f"{ts}-{slug}-attachments"
-        for fp in deliverables:
-            try:
-                src = Path(fp)
-                if not src.is_absolute():
-                    src = PROJECT_ROOT / fp
-                if src.exists() and src.is_file():
-                    attach_dir.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, attach_dir / src.name)
-            except Exception as e:
-                log_debug(f"산출물 복사 실패({fp}): {e}")
-        if attach_dir.exists():
-            body += f"\n\n## 산출물\n- [{attach_dir.name}]({attach_dir.name}/)\n"
+        body += f"\n\n## 산출물\n- [{attach_dirname}]({attach_dirname}/)\n"
 
-    target_file.write_text(body, encoding="utf-8")
+    def prepare(root: Path):
+        wt_target = root / "waypoints" / "tags" / target_rel
+        wt_target.parent.mkdir(parents=True, exist_ok=True)
+        wt_target.write_text(body, encoding="utf-8")
 
-    rel_path = target_file.relative_to(TAGS_DIR.parent).as_posix()
-    update_index(project, primary_tag, status, title, rel_path, has_alt)
+        if deliverables:
+            attach_dir = wt_target.parent / attach_dirname
+            for fp in deliverables:
+                try:
+                    src = Path(fp)
+                    if not src.is_absolute():
+                        src = PROJECT_ROOT / fp
+                    if src.exists() and src.is_file():
+                        attach_dir.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src, attach_dir / src.name)
+                except Exception as e:
+                    log_debug(f"산출물 복사 실패({fp}): {e}")
 
-    # 정리 끝났으니 진행 중 원문 로그(inprogress)는 삭제 — 최종본이 tags/에 있음
-    tmp_file.unlink(missing_ok=True)
+        (root / "waypoints" / "inprogress" / project / f"{session_id}.md").unlink(missing_ok=True)
+
+        update_index(
+            project, primary_tag, status, title,
+            f"tags/{target_rel.as_posix()}", has_alt,
+            index_file=root / "waypoints" / "INDEX.md",
+        )
+
+    message = f"waypoint: {project} / {title}"
+    if not sync_waypoints_to_master(prepare, message):
+        log_debug(f"master 동기화 실패({session_id}), 현재 브랜치로 폴백")
+        prepare(PROJECT_ROOT)
+        git_commit_and_push(["waypoints"], message, use_add_all=True)
+
     state_path(session_id).unlink(missing_ok=True)
-
-    git_commit_and_push(
-        ["waypoints/tags", "waypoints/INDEX.md",
-         tmp_file.relative_to(PROJECT_ROOT).as_posix()],
-        f"waypoint: {project} / {title}",
-        use_add_all=True,
-    )
 
 
 def main() -> None:
