@@ -129,8 +129,8 @@ def git_commit_and_push(add_paths: list, message: str, use_add_all: bool = False
             return True  # 커밋할 변경 없음 — 정상
 
         commit = subprocess.run(
-            ["git", "-C", str(PROJECT_ROOT), "-c", "user.email=waypoint@local",
-             "-c", "user.name=Waypoint Bot", "commit", "-m", message],
+            ["git", "-C", str(PROJECT_ROOT), "-c", "user.email=noreply@anthropic.com",
+             "-c", "user.name=Claude", "commit", "-m", message],
             capture_output=True, text=True, timeout=15,
         )
         if commit.returncode != 0:
@@ -238,8 +238,8 @@ def sync_waypoints_to_master(prepare_fn, commit_message: str, max_retries: int =
                 pushed = True  # 커밋할 변경 없음(이미 최신) — 정상
                 break
             commit = subprocess.run(
-                ["git", "-C", tmp_dir, "-c", "user.email=waypoint@local",
-                 "-c", "user.name=Waypoint Bot", "commit", "-m", commit_message],
+                ["git", "-C", tmp_dir, "-c", "user.email=noreply@anthropic.com",
+                 "-c", "user.name=Claude", "commit", "-m", commit_message],
                 capture_output=True, text=True, timeout=15,
             )
             if commit.returncode != 0:
@@ -285,8 +285,8 @@ def sync_waypoints_to_master(prepare_fn, commit_message: str, max_retries: int =
             subprocess.run(["git", "-C", str(PROJECT_ROOT), "add", "-A", "--", "waypoints"],
                             capture_output=True, text=True, timeout=15)
             subprocess.run(
-                ["git", "-C", str(PROJECT_ROOT), "-c", "user.email=waypoint@local",
-                 "-c", "user.name=Waypoint Bot", "commit", "-m",
+                ["git", "-C", str(PROJECT_ROOT), "-c", "user.email=noreply@anthropic.com",
+                 "-c", "user.name=Claude", "commit", "-m",
                  f"{commit_message} (local mirror; 이미 {default_branch}에 push됨, "
                  f"이 브랜치로는 push 안 함)"],
                 capture_output=True, text=True, timeout=15,
