@@ -1,31 +1,32 @@
 #!/usr/bin/env python3
-"""SessionEnd 훅 (best-effort) + 고아 임시파일 복구용 finalize_session().
+"""SessionEnd 훅 (best-effort) + 고아 원문로그 복구용 finalize_session().
 
 session_start.py도 이 파일의 finalize_session()을 import해서 재사용한다
 (정상 종료 시엔 SessionEnd가, 비정상 종료 시엔 다음 SessionStart가 호출).
 
-하는 일:
-1. 임시 md를 읽어서 헤드리스 claude -p 호출로 태그/상태/제목/요약을 분류
+원문 자체는 이미 Stop 훅이 매 턴 커밋+푸시해뒀으므로(waypoints/inprogress/),
+여기서는 데이터 유실 걱정 없이 "정리"만 담당한다:
+1. inprogress의 원문 md를 읽어서 헤드리스 claude -p 호출로 태그/상태/제목/요약을 분류
 2. 실패하면 "미분류" 태그로 원문 그대로 저장 (데이터 유실 방지가 최우선)
 3. waypoints/tags/<project>/<tag>/<timestamp>-<slug>.md 로 저장
 4. 산출물로 언급된 파일들을 attachments/ 로 복사
 5. INDEX.md(태그트리) 갱신
-6. 전부 git commit + push
-7. 임시파일 정리
+6. inprogress 원문 파일 삭제
+7. 전부 git commit + push
 """
 import re
 import shutil
-import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib_common import (  # noqa: E402
-    PROJECT_ROOT, TAGS_DIR, INDEX_FILE, TMP_DIR,
-    log_debug, read_hook_input, temp_md_path, state_path,
-    slugify, call_claude_headless, extract_first_json_object,
-    in_headless_recursion_guard,
+    PROJECT_ROOT, TAGS_DIR, INDEX_FILE,
+    log_debug, read_hook_input, inprogress_md_path, state_path,
+    detect_project_name, slugify, call_claude_headless,
+    extract_first_json_object, in_headless_recursion_guard,
+    git_commit_and_push,
 )
 
 STATUS_LABEL = {"in_progress": "진행중", "done": "완료", "paused": "보류"}
@@ -53,13 +54,6 @@ status 판단 기준:
 {content}
 ---
 """
-
-
-def extract_project(content: str) -> str:
-    m = re.search(r"<!--\s*project:\s*(.*?)\s*\|", content)
-    if m:
-        return m.group(1).strip()
-    return "misc"
 
 
 def extract_deliverable_paths(content: str) -> list:
@@ -121,46 +115,21 @@ def update_index(project: str, tag: str, status: str, title: str,
     INDEX_FILE.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
-def git_commit_and_push(message: str) -> None:
-    try:
-        subprocess.run(["git", "-C", str(PROJECT_ROOT), "add", "waypoints"],
-                        capture_output=True, text=True, timeout=15)
-        # 커밋할 게 없으면 조용히 넘어감
-        status = subprocess.run(["git", "-C", str(PROJECT_ROOT), "diff", "--cached", "--quiet"],
-                                 capture_output=True, timeout=10)
-        if status.returncode == 0:
-            return
-        subprocess.run(
-            ["git", "-C", str(PROJECT_ROOT), "-c", "user.email=waypoint@local",
-             "-c", "user.name=Waypoint Bot", "commit", "-m", message],
-            capture_output=True, text=True, timeout=15,
-        )
-        push = subprocess.run(["git", "-C", str(PROJECT_ROOT), "push"],
-                               capture_output=True, text=True, timeout=60)
-        if push.returncode != 0:
-            log_debug(f"git push 실패, pull --rebase 후 재시도: {push.stderr[:300]}")
-            subprocess.run(["git", "-C", str(PROJECT_ROOT), "pull", "--rebase"],
-                            capture_output=True, text=True, timeout=60)
-            retry = subprocess.run(["git", "-C", str(PROJECT_ROOT), "push"],
-                                    capture_output=True, text=True, timeout=60)
-            if retry.returncode != 0:
-                log_debug(f"git push 재시도도 실패(로컬 커밋은 유지됨): {retry.stderr[:300]}")
-    except Exception as e:
-        log_debug(f"git_commit_and_push 예외: {e}")
-
-
-def finalize_session(session_id: str) -> None:
-    tmp_file = temp_md_path(session_id)
+def finalize_session(project: str, session_id: str) -> None:
+    tmp_file = inprogress_md_path(project, session_id)
     if not tmp_file.exists():
         return
     content = tmp_file.read_text(encoding="utf-8")
-    if not content.strip() or len(content.splitlines()) <= 2:
-        # 헤더만 있고 실제 대화가 없으면 그냥 정리만 하고 끝
+    if not content.strip() or len(content.splitlines()) <= 3:
+        # 헤더(+경고 문구)만 있고 실제 대화가 없으면 그냥 정리만 하고 끝
         tmp_file.unlink(missing_ok=True)
         state_path(session_id).unlink(missing_ok=True)
+        git_commit_and_push(
+            [tmp_file.relative_to(PROJECT_ROOT).as_posix()],
+            f"waypoint: {project} 빈 세션 기록 정리 (session {session_id[:8]})",
+            use_add_all=True,
+        )
         return
-
-    project = extract_project(content)
 
     prompt = CLASSIFY_INSTRUCTIONS.format(content=content[:20000])
     raw_response = call_claude_headless(prompt, timeout=45)
@@ -218,10 +187,16 @@ def finalize_session(session_id: str) -> None:
     rel_path = target_file.relative_to(TAGS_DIR.parent).as_posix()
     update_index(project, primary_tag, status, title, rel_path, has_alt)
 
-    git_commit_and_push(f"waypoint: {project} / {title}")
-
+    # 정리 끝났으니 진행 중 원문 로그(inprogress)는 삭제 — 최종본이 tags/에 있음
     tmp_file.unlink(missing_ok=True)
     state_path(session_id).unlink(missing_ok=True)
+
+    git_commit_and_push(
+        ["waypoints/tags", "waypoints/INDEX.md",
+         tmp_file.relative_to(PROJECT_ROOT).as_posix()],
+        f"waypoint: {project} / {title}",
+        use_add_all=True,
+    )
 
 
 def main() -> None:
@@ -229,7 +204,9 @@ def main() -> None:
         return
     data = read_hook_input()
     session_id = data.get("session_id") or "unknown-session"
-    finalize_session(session_id)
+    cwd = data.get("cwd") or "."
+    project = detect_project_name(cwd)
+    finalize_session(project, session_id)
 
 
 if __name__ == "__main__":
