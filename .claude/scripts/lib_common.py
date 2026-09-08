@@ -15,10 +15,16 @@ from pathlib import Path
 # .claude/scripts/lib_common.py -> 프로젝트 루트
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 WAYPOINTS_DIR = PROJECT_ROOT / "waypoints"
-TMP_DIR = WAYPOINTS_DIR / ".tmp"
+TMP_DIR = WAYPOINTS_DIR / ".tmp"  # 세션 진행 오프셋(state.json)만 로컬에 둔다 — git에 안 올라감
+INPROGRESS_DIR = WAYPOINTS_DIR / "inprogress"  # 진행 중 세션의 원문 로그. git-tracked.
 TAGS_DIR = WAYPOINTS_DIR / "tags"
 INDEX_FILE = WAYPOINTS_DIR / "INDEX.md"
 DEBUG_LOG = WAYPOINTS_DIR / ".debug.log"
+
+# 원격 웹 세션은 Archive를 눌러도 SessionEnd가 컨테이너 회수 전에 반드시
+# 끝난다는 보장이 없다. 그래서 원문은 로컬에만 쌓아두지 않고 Stop 훅이
+# 매 턴 이 디렉터리에 커밋+푸시한다 (git에 이미 올라간 내용은 컨테이너가
+# 죽어도 사라지지 않는다). SessionEnd는 이걸 읽어 분류/정리만 담당한다.
 
 
 def log_debug(msg: str) -> None:
@@ -75,12 +81,75 @@ def detect_project_name(cwd: str) -> str:
     return slugify(cwd_path.name)
 
 
-def temp_md_path(session_id: str) -> Path:
-    return TMP_DIR / f"{session_id}.md"
+def inprogress_md_path(project: str, session_id: str) -> Path:
+    return INPROGRESS_DIR / project / f"{session_id}.md"
 
 
 def state_path(session_id: str) -> Path:
     return TMP_DIR / f"{session_id}.state.json"
+
+
+def git_last_commit_epoch(rel_path) -> int:
+    """rel_path(PROJECT_ROOT 기준 상대경로)의 마지막 커밋 시각(unix epoch).
+    커밋 이력이 없으면 None. 로컬 mtime과 달리 컨테이너가 새로 clone돼도
+    유효하다 — "이 파일이 최근에 실제로 활동 중인 세션에서 갱신됐는지"를
+    파일시스템이 아니라 git 이력으로 판단하기 위함."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "log", "-1", "--format=%ct", "--", str(rel_path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        out = result.stdout.strip()
+        if result.returncode == 0 and out:
+            return int(out)
+    except Exception as e:
+        log_debug(f"git_last_commit_epoch 실패({rel_path}): {e}")
+    return None
+
+
+def git_commit_and_push(add_paths: list, message: str, use_add_all: bool = False) -> bool:
+    """지정된 경로(들)만 스테이징해서 커밋+푸시. 다른 미관련 변경사항은
+    건드리지 않는다. 실패해도 예외를 던지지 않고 False를 반환한다
+    (훅이 죽으면 안 되므로). use_add_all=True면 삭제도 확실히 잡도록
+    `git add -A <path>`를 쓴다 (경로 아래 파일이 삭제된 경우 등)."""
+    try:
+        add_cmd = ["git", "-C", str(PROJECT_ROOT), "add"]
+        if use_add_all:
+            add_cmd.append("-A")
+        add_cmd += ["--"] + list(add_paths)
+        subprocess.run(add_cmd, capture_output=True, text=True, timeout=15)
+
+        status = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "diff", "--cached", "--quiet"],
+            capture_output=True, timeout=10,
+        )
+        if status.returncode == 0:
+            return True  # 커밋할 변경 없음 — 정상
+
+        commit = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "-c", "user.email=waypoint@local",
+             "-c", "user.name=Waypoint Bot", "commit", "-m", message],
+            capture_output=True, text=True, timeout=15,
+        )
+        if commit.returncode != 0:
+            log_debug(f"git commit 실패: {commit.stderr[:300]}")
+            return False
+
+        push = subprocess.run(["git", "-C", str(PROJECT_ROOT), "push"],
+                               capture_output=True, text=True, timeout=60)
+        if push.returncode != 0:
+            log_debug(f"git push 실패, pull --rebase 후 재시도: {push.stderr[:300]}")
+            subprocess.run(["git", "-C", str(PROJECT_ROOT), "pull", "--rebase"],
+                            capture_output=True, text=True, timeout=60)
+            retry = subprocess.run(["git", "-C", str(PROJECT_ROOT), "push"],
+                                    capture_output=True, text=True, timeout=60)
+            if retry.returncode != 0:
+                log_debug(f"git push 재시도도 실패(로컬 커밋은 유지됨): {retry.stderr[:300]}")
+                return False
+        return True
+    except Exception as e:
+        log_debug(f"git_commit_and_push 예외({add_paths}): {e}")
+        return False
 
 
 def load_state(session_id: str) -> dict:
