@@ -35,6 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib_common import (  # noqa: E402
     PROJECT_ROOT, INDEX_FILE, CHECKPOINT_THRESHOLD_CHARS, inprogress_md_path,
+    structured_inprogress_path, split_structured_meta,
     log_debug, read_hook_input, detect_project_name, load_state, save_state,
     read_transcript_entries, extract_text_and_files, in_headless_recursion_guard,
     git_commit_and_push, sync_waypoints_to_master, extract_known_tags,
@@ -97,27 +98,48 @@ def main() -> None:
         f"정리된 최종 기록으로 대체됩니다.\n"
     )
 
-    pending_text = (state.get("pending_text") or "") + chunk_text
-
     # 원문 파일이 이번 턴까지 반영되면 가질 총 길이 — 체크포인트가 돌면
     # "여기까지는 이미 구조화했다"는 표시로 구조화 임시본 헤더에 남긴다
     # (raw_consumed_chars). 로컬에 이미 미러링된 원문 길이 + 이번 턴 조각.
     local_raw = inprogress_md_path(project, session_id)
-    existing_raw_len = len(local_raw.read_text(encoding="utf-8")) if local_raw.exists() else len(header_text)
-    raw_total_chars = existing_raw_len + len(chunk_text)
+    existing_raw_text = local_raw.read_text(encoding="utf-8") if local_raw.exists() else header_text
+    raw_total_chars = len(existing_raw_text) + len(chunk_text)
 
     # 체크포인트(map 단계): 임계값을 넘었을 때만 AI 호출 — 계산은 여기서
     # 딱 한 번만 하고, prepare()는 그 결과를 그대로 적용만 한다 (재시도돼도
     # 매번 같은 값을 적용해야 안전하므로 datetime.now() 등을 prepare 안에서
     # 새로 계산하지 않는다).
+    #
+    # pending_text/primary_tag/file_ts/file_slug/current_hashtag는 로컬
+    # state.json이 아니라 구조화 임시본의 git 추적 메타 헤더(+원문 파일)를
+    # 우선한다 — state.json은 `waypoints/.tmp/`(git 미추적)에 있어서 턴
+    # 사이에 사라질 수 있는데, 그러면 이미 진행 중이던 체크포인트를 "이번이
+    # 첫 조각"으로 오인해 매번 새 file_ts/파일을 만들어버리고, 이전
+    # 체크포인트가 INDEX.md에 남긴 링크는 영원히 고아가 된다(실제로 겪은
+    # 버그). 구조화 임시본은 매 체크포인트마다 커밋되는 git 추적 파일이라
+    # 더 안정적인 진실 공급원이다. pending_text는 raw_consumed_chars 이후의
+    # 원문 조각으로 역산한다 — session_end.py의 finalize_session()과 같은
+    # 방식.
+    structured_path = structured_inprogress_path(project, session_id)
+    structured_meta = {}
+    if structured_path.exists():
+        structured_meta, _ = split_structured_meta(structured_path.read_text(encoding="utf-8"))
+
+    consumed = structured_meta.get("raw_consumed_chars")
+    if consumed is not None:
+        pending_text = existing_raw_text[consumed:] + chunk_text
+    else:
+        pending_text = (state.get("pending_text") or "") + chunk_text
+
     checkpoint_result = None
-    primary_tag = state.get("primary_tag")
-    file_ts = state.get("file_ts")
-    file_slug = state.get("file_slug")
+    primary_tag = structured_meta.get("primary_tag") or state.get("primary_tag")
+    file_ts = structured_meta.get("file_ts") or state.get("file_ts")
+    file_slug = structured_meta.get("file_slug") or state.get("file_slug")
+    current_hashtag = structured_meta.get("current_hashtag") or state.get("current_hashtag")
     rel_path = None
     if len(pending_text) >= CHECKPOINT_THRESHOLD_CHARS:
         known_tags = extract_known_tags(INDEX_FILE.read_text(encoding="utf-8")) if INDEX_FILE.exists() else []
-        checkpoint_result = classify_checkpoint(state.get("current_hashtag"), known_tags, pending_text)
+        checkpoint_result = classify_checkpoint(current_hashtag, known_tags, pending_text)
         primary_tag = primary_tag or checkpoint_result["hashtag"]
         file_ts = file_ts or datetime.now().strftime("%Y%m%d-%H%M%S")
         file_slug = file_slug or slugify(checkpoint_result["chunk_title"])
