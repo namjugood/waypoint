@@ -41,7 +41,12 @@ def recover_orphans(current_session_id: str) -> None:
     if not INPROGRESS_DIR.exists():
         return
     now = time.time()
+    # *.structured.md(체크포인트로 쌓이는 구조화 임시본)는 원문(raw) 파일과
+    # 짝을 이루는 파생물이라 여기서 별도 세션으로 잡으면 안 된다 — sid를
+    # "<진짜세션ID>.structured"로 잘못 파싱하게 된다. 원문 파일만 훑는다.
     for md_file in INPROGRESS_DIR.glob("*/*.md"):
+        if md_file.name.endswith(".structured.md"):
+            continue
         sid = md_file.stem
         if sid == current_session_id:
             continue
