@@ -7,8 +7,9 @@
 
 ## waypoint
 
-### waypoint (진행중)
+### waypoint (완료)
 - [2026-09-08 07:56] Waypoint 세션 저장 버그 수정 — [파일](tags/waypoint/waypoint/20260908-075626-waypoint-세션-저장-버그-수정.md) ⭐(미탐색 대안 있음)
 - #waypoint
   - [05:51] 체크포인트 기반 요약 구현·배포 — [파일](tags/waypoint/waypoint/20260909-055105-체크포인트-기반-요약-구현배포.md)
   - [05:54] 체크포인트 구조 구현·배포 — [파일](tags/waypoint/waypoint/20260909-055433-체크포인트-구조-구현배포.md)
+  - [06:00] 저장된 기록 브리핑 조회 — [파일](tags/waypoint/waypoint/20260909-060041-저장된-기록-브리핑-조회.md) ⭐(미탐색 대안 있음)
