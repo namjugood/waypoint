@@ -13,3 +13,4 @@
   - [05:54] 체크포인트 구조 구현·배포 — [파일](tags/waypoint/waypoint/20260909-055433-체크포인트-구조-구현배포.md)
   - [06:04] waypoint 조회 및 링크 오류 확인 — [파일](tags/waypoint/waypoint/20260909-060401-waypoint-조회-및-링크-오류-확인.md) ⭐(미탐색 대안 있음)
   - [07:11] file_ts 중복 버그 원인 규명 및 수정 — [파일](tags/waypoint/waypoint/20260909-071131-체크포인트-file-ts-중복-버그-진단.md) ⭐(미탐색 대안 있음)
+  - [07:47] waypoint 스킬 정상 작동 테스트 — [파일](tags/waypoint/waypoint/20260909-074712-waypoint-스킬-정상-작동-테스트.md) ⭐(미탐색 대안 있음)
