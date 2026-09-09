@@ -1,15 +1,7 @@
-<!-- project: waypoint | session: 160329fb-576c-50c8-82db-2f28c7a8a222 -->
-# Waypoint 진행 중 원문 로그 (waypoint)
-
-> ⚠️ 자동 누적 로그입니다. AI 분류 전 원문이며, 세션 종료 시 정리된 최종 기록으로 대체됩니다.
-
-### [06:00:30] 사용자
-<command-message>waypoint</command-message>
-<command-name>/waypoint</command-name>
-<command-args>지금까지 어떤얘기들이 저장되어있나요?</command-args>
-
-### [06:00:30] 사용자
-Base directory for this skill: /home/user/waypoint/.claude/skills/waypoint
+---
+name: waypoint
+description: 이 프로젝트에 쌓인 Waypoint 기록(waypoints/ 폴더)을 조회해서 답해주는 스킬. 사용자가 "/waypoint", "waypoint 조회", "이전에 뭐 했는지", "ADR 만들어줘", "비슷한 거 있었어?", "회고", "브리핑" 등을 요청하면 사용.
+---
 
 # Waypoint 조회 스킬
 
@@ -102,27 +94,3 @@ INDEX.md의 대표 태그/해시태그만 보고 판단하지 말 것 — 관련
   최후 수단). 검색된 걸 전부 열어보지 않는다.
 - 이 스킬은 waypoints/ 데이터를 **읽기 전용**으로 다룬다. 기록 자체를
   수정/삭제하는 건 이 스킬의 역할이 아니다 (그건 훅이 담당).
-
-
-ARGUMENTS: 지금까지 어떤얘기들이 저장되어있나요?
-
-### [06:00:30] Claude
-이 프로젝트(`waypoint`)에 저장된 기록을 확인했습니다.
-
-## 진행중
-- **체크포인트 기반 요약 구현·배포** (2026-09-09 05:51~05:54, 세션 `51dcb894`)
-  - Stop 훅이 ~4,000자마다 체크포인트 단위로 소형 AI 호출로 분류 → SessionEnd가 마지막 잔여분만 flush하는 방식으로 **20,000자 절단 버그**를 구조적으로 해결
-  - INDEX.md를 `프로젝트 → 대표태그(상태) → #해시태그 → 항목` 3단 구조로 개편 (지금 이 스킬이 읽고 있는 그 구조입니다)
-  - 원문 보존 방식을 `waypoints/raw/`로 이동 + `raw:` frontmatter 연결로 변경
-  - 오펀(고아) 세션 복구 버그 수정: 체크포인트 메타데이터를 로컬 대신 git 추적 파일 헤더에 저장
-  - SKILL.md·README(양쪽 저장소) 갱신, 실제 모델 호출로 검증 후 커밋·푸시까지 진행
-  - ⚠️ 다만 이 두 항목은 아직 `waypoints/tags/`에 최종 분류되어 있지 않고, `waypoints/inprogress/`에만 남아있습니다(SessionEnd로 아직 정리되지 않은 상태) — INDEX.md가 링크한 파일이 실제로는 없습니다.
-
-## 완료
-- **Waypoint 세션 저장 버그 수정** (2026-09-08 07:56, [파일](tags/waypoint/waypoint/20260908-075626-waypoint-세션-저장-버그-수정.md))
-  - 원격 웹 세션은 매번 새 컨테이너로 시작·종료되는데, 대화 원문이 git 미추적 `waypoints/.tmp/`에만 있다가 컨테이너 회수와 함께 유실되던 근본 원인을 진단
-  - 해결: `Stop` 훅이 매 턴 `waypoints/inprogress/`(git 추적)에 append 후 즉시 commit+push, `SessionEnd`는 분류·정리만 담당하도록 재설계
-  - 오펀 복구 로직도 로컬 mtime 대신 git 커밋 이력 기준으로 변경
-  - ⭐ 미탐색 대안: claude-mem의 `PostToolUse`(툴 호출 단위 기록), `PreCompact`(컨텍스트 압축 전 백업) 훅 아이디어는 검토만 하고 반영 안 함
-
-궁금한 세부 내용(예: "체크포인트 항목 원문 더 보여줘", "미탐색 대안 자세히" 등)이 있으면 말씀해 주세요.
